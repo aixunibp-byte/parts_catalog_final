@@ -1,0 +1,168 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# Общие настройки изоляции контейнеров приложения (api, sync_worker): без
+# root-привилегий, без Linux capabilities, без повышения прав через setuid.
+x-app-hardening: &app-hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 200
+  logging: *default-logging
+
+services:
+  db:
+    image: postgres:16
+    restart: always
+    # Без env_file: контейнеру БД не нужны ключи Ozon и прочие секреты из .env —
+    # ему передаются только три переменные ниже.
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 200
+    logging: *default-logging
+    # Только внутренняя сеть без выхода наружу: до БД достучаться можно лишь
+    # из api и sync_worker, а сама БД в интернет ходить не может.
+    networks: [db_network]
+
+  api:
+    build: ./app
+    restart: always
+    env_file: .env
+    volumes:
+      - uploads:/app/uploads
+      - price_inbox:/inbox:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    mem_limit: 512m
+    cpus: 1.0
+    <<: *app-hardening
+    # api видит БД (db_network) и nginx (app_network); наружу порт не публикуется.
+    networks: [app_network, db_network]
+
+  sync_worker:
+    build: ./app
+    restart: always
+    env_file: .env
+    command: ["python", "scheduler.py"]
+    volumes:
+      - uploads:/app/uploads
+      - price_inbox:/inbox:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: 512m
+    cpus: 1.0
+    <<: *app-hardening
+    # Нужен выход наружу (Ozon API, FTP) и доступ к БД; входящих портов нет.
+    networks: [app_network, db_network]
+
+  # Встроенный FTP(S)-сервер для загрузки прайсов (csv/xls/xlsx). Пишет в том
+  # price_inbox, из которого импорт цен читает файл при адресе «local» (админка ->
+  # Синхронизация). Не получает .env целиком — только свои переменные; к БД
+  # доступа нет (только app_network). Открытые порты: 21 и пассивный диапазон —
+  # их же откройте в файрволе (scripts/harden-host.sh делает это сам).
+  ftp:
+    build: ./app
+    restart: always
+    command: ["python", "ftp_server.py"]
+    environment:
+      FTP_UPLOAD_USER: ${FTP_UPLOAD_USER:-prices}
+      FTP_UPLOAD_PASSWORD: ${FTP_UPLOAD_PASSWORD:-}
+      FTP_PUBLIC_IP: ${FTP_PUBLIC_IP:-}
+      FTP_PASV_PORTS: ${FTP_PASV_PORTS:-30000-30009}
+      FTP_ALLOW_PLAIN: ${FTP_ALLOW_PLAIN:-0}
+      FTP_TLS_CN: ${FTP_TLS_CN:-ftp.omegation.local}
+      FTP_MAX_UPLOAD_MB: ${FTP_MAX_UPLOAD_MB:-50}
+      FTP_MAX_CONS_PER_IP: ${FTP_MAX_CONS_PER_IP:-3}
+      FTP_LISTEN_PORT: "2121"
+    ports:
+      - "${FTP_PORT:-21}:2121"
+      - "${FTP_PASV_PORTS:-30000-30009}:${FTP_PASV_PORTS:-30000-30009}"
+    volumes:
+      - price_inbox:/inbox
+      - ftp_state:/state
+      # Необязательно: свой сертификат (fullchain.pem и privkey.pem) в ./ftp-tls
+      # (владелец uid 1000). Без него создаётся самоподписанный.
+      - ./ftp-tls:/tls:ro
+    mem_limit: 256m
+    cpus: 0.5
+    <<: *app-hardening
+    networks: [app_network]
+
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+      - uploads:/usr/share/nginx/uploads:ro
+      - certbot-webroot:/var/www/certbot:ro
+      - certbot-certs:/etc/letsencrypt:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 100
+    security_opt:
+      - no-new-privileges:true
+    logging: *default-logging
+    networks: [app_network]
+
+  # Выпуск/автопродление сертификата Let's Encrypt. Ничего не делает, пока не
+  # запущен вручную (см. README) — нужен настоящий домен, указывающий на этот
+  # сервер (на голый IP сертификат не выпускается).
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certbot-webroot:/var/www/certbot
+      - certbot-certs:/etc/letsencrypt
+    entrypoint: >
+      sh -c "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot; sleep 12h; done"
+    networks: [app_network]
+
+volumes:
+  pgdata:
+  uploads:
+  price_inbox:
+  ftp_state:
+  certbot-webroot:
+  certbot-certs:
+
+networks:
+  app_network:
+    driver: bridge
+  db_network:
+    driver: bridge
+    internal: true

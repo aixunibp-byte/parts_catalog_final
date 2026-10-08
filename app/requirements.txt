@@ -1,0 +1,17 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.0
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+ozonapi-async==0.89.0
+apscheduler==3.10.4
+python-multipart==0.0.20
+httpx==0.27.2
+Pillow==11.3.0
+slowapi==0.1.10
+alembic==1.20.0
+openpyxl==3.1.5
+xlrd==1.2.0
+defusedxml==0.7.1
+pyftpdlib==2.0.1
+pyOpenSSL==25.1.0
